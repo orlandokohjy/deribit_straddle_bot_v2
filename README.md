@@ -36,8 +36,8 @@ python main.py close     # emergency: cancel all orders + close all positions
 | `DERIBIT_CLIENT_ID` | — | API key |
 | `DERIBIT_CLIENT_SECRET` | — | API secret |
 | `DERIBIT_ENV` | `test` | `test` or `prod` |
-| `TARGET_DTE` | `7` | Target days to expiry |
-| `DTE_TOLERANCE` | `2` | DTE search window ± |
+| `TARGET_DTE` | `0` | Target days to expiry (0 = nearest/0DTE) |
+| `DTE_TOLERANCE` | `1` | DTE search window ± |
 | `EQUITY_PCT` | `0.20` | Fraction of equity to allocate |
 | `TIER1_FRACTION` | `0.20` | Fraction of contracts for Tier 1 (1/5) |
 | `TAKE_PROFIT_PCT` | `0.50` | Combined premium TP threshold |

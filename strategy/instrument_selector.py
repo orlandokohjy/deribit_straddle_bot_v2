@@ -35,7 +35,7 @@ def select_straddle(client: DeribitClient, settings: Settings) -> StraddleInstru
     spot = float(spot_result["index_price"])
     now = utcnow()
 
-    min_dte = settings.target_dte - settings.dte_tolerance
+    min_dte = max(0.01, settings.target_dte - settings.dte_tolerance)
     max_dte = settings.target_dte + settings.dte_tolerance
 
     expiry_map: dict[int, list[dict[str, Any]]] = {}
