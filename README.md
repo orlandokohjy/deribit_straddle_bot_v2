@@ -26,6 +26,7 @@ cp .env.example .env   # fill in credentials
 python main.py run       # full lifecycle: enter → monitor → exit
 python main.py dry-run   # select instruments + size, no orders
 python main.py status    # show current positions and open orders
+python main.py close     # emergency: cancel all orders + close all positions
 ```
 
 ## Configuration (.env)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -39,7 +39,7 @@ class StraddleOrchestrator:
             second=0, microsecond=0,
         )
         if exit_dt <= now:
-            exit_dt = exit_dt.replace(day=exit_dt.day + 1)
+            exit_dt += timedelta(days=1)
         return exit_dt
 
     def _on_tp_hit(self) -> None:

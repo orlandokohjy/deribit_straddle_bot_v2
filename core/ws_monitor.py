@@ -179,7 +179,3 @@ class PriceMonitor:
                 backoff = min(backoff * 2, 30.0)
 
         log.info("ws_monitor_stopped")
-
-    def request_stop(self) -> None:
-        if self._stop_event:
-            self._stop_event.set()
