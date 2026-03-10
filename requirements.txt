@@ -1,0 +1,4 @@
+httpx
+websockets
+structlog
+python-dotenv
