@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -9,6 +10,8 @@ import structlog
 from config.settings import Settings
 
 log = structlog.get_logger("deribit.client")
+
+_TOKEN_REFRESH_BUFFER_S = 60
 
 
 class DeribitClientError(Exception):
@@ -36,16 +39,21 @@ class DeribitClient:
     """Synchronous REST client for Deribit API v2.
 
     Used for all order execution. Supports parallel() for concurrent requests.
+    Auto-refreshes the access token before it expires.
     """
 
     def __init__(self, settings: Settings) -> None:
         self._base_url = settings.rest_url
+        self._client_id = settings.client_id
+        self._client_secret = settings.client_secret
         self._session = httpx.Client(
             timeout=15.0,
             limits=httpx.Limits(max_keepalive_connections=0),
         )
         self._token: str | None = None
-        self._authenticate(settings.client_id, settings.client_secret)
+        self._refresh_token: str | None = None
+        self._token_expires_at: float = 0.0
+        self._authenticate()
 
     def close(self) -> None:
         self._session.close()
@@ -56,7 +64,21 @@ class DeribitClient:
     def __exit__(self, *_: Any) -> None:
         self.close()
 
+    def _ensure_token(self) -> None:
+        """Refresh the access token if it's about to expire."""
+        if time.monotonic() < self._token_expires_at - _TOKEN_REFRESH_BUFFER_S:
+            return
+        if self._refresh_token:
+            try:
+                self._do_refresh()
+                return
+            except DeribitClientError:
+                log.warning("refresh_token_failed_falling_back_to_reauth")
+        self._authenticate()
+
     def _request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        if not method.startswith("public/auth"):
+            self._ensure_token()
         url = f"{self._base_url}/{method}"
         headers = {}
         if self._token:
@@ -76,6 +98,7 @@ class DeribitClient:
         return self._request(f"private/{method}", params)
 
     def parallel(self, *calls: tuple[str, dict[str, Any] | None]) -> list[Any]:
+        self._ensure_token()
         results: list[Any] = [None] * len(calls)
         with ThreadPoolExecutor(max_workers=len(calls)) as pool:
             futures = {
@@ -86,14 +109,30 @@ class DeribitClient:
                 results[futures[fut]] = fut.result()
         return results
 
-    def _authenticate(self, client_id: str, client_secret: str) -> None:
+    def _store_auth(self, result: dict[str, Any]) -> None:
+        self._token = result["access_token"]
+        self._refresh_token = result.get("refresh_token")
+        expires_in = int(result.get("expires_in", 900))
+        self._token_expires_at = time.monotonic() + expires_in
+        log.info("authenticated",
+                 env=self._base_url.split("//")[1].split("/")[0],
+                 expires_in_s=expires_in)
+
+    def _authenticate(self) -> None:
         result = self.public("auth", {
-            "client_id": client_id,
-            "client_secret": client_secret,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
             "grant_type": "client_credentials",
         })
-        self._token = result["access_token"]
-        log.info("authenticated", env=self._base_url.split("//")[1].split("/")[0])
+        self._store_auth(result)
+
+    def _do_refresh(self) -> None:
+        result = self.public("auth", {
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token,
+        })
+        self._store_auth(result)
+        log.info("token_refreshed")
 
     @property
     def token(self) -> str | None:
