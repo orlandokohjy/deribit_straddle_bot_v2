@@ -29,6 +29,21 @@ python main.py status    # show current positions and open orders
 python main.py close     # emergency: cancel all orders + close all positions
 ```
 
+## Scheduling (cron)
+
+To run automatically at 14:00 UTC on weekdays (Mon–Fri):
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add this line (adjust the python path if needed)
+0 14 * * 1-5 cd /path/to/deribit_straddle_bot_v2 && /usr/bin/python3 main.py run >> /tmp/straddle_run.log 2>&1
+```
+
+> **Note:** The machine must be awake at 14:00 UTC for the cron job to fire.
+> For reliable daily execution, run on a cloud VM (e.g., AWS, GCP, DigitalOcean).
+
 ## Configuration (.env)
 
 | Variable | Default | Description |
