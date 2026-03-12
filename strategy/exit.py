@@ -67,6 +67,11 @@ def _cancel_all_for_instrument(client: DeribitClient, instrument_name: str) -> i
         return 0
 
 
+def _round_amount(amount: float) -> float:
+    """Round to 1 decimal place (Deribit BTC option minimum increment is 0.1)."""
+    return round(amount, 1)
+
+
 def _close_leg(
     client: DeribitClient,
     instrument_name: str,
@@ -75,7 +80,7 @@ def _close_leg(
     label: str,
 ) -> None:
     """Close a position leg with aggressive limit sell + market fallback."""
-    remaining = amount
+    remaining = _round_amount(amount)
 
     for attempt in range(1, settings.max_order_retries + 1):
         book = client.public("get_order_book", {"instrument_name": instrument_name, "depth": "1"})
@@ -108,7 +113,7 @@ def _close_leg(
         if filled >= remaining:
             log.info("leg_closed", instrument=instrument_name)
             return
-        remaining -= filled
+        remaining = _round_amount(remaining - filled)
         log.info("partial_close_fill", instrument=instrument_name, filled=filled, remaining=remaining)
         if attempt < settings.max_order_retries:
             time.sleep(2.0)
