@@ -15,6 +15,30 @@ log = structlog.get_logger("strategy.entry")
 _OPTION_TICK_SIZE = 0.0005
 
 
+class EntryCapBreached(Exception):
+    """Raised when a leg's fill price exceeds the allowed cap above cached ask."""
+
+    def __init__(
+        self,
+        leg: str,
+        fill_price: float,
+        cached_ask: float,
+        cap_pct: float,
+        call_leg: "FilledLeg | None" = None,
+        put_leg: "FilledLeg | None" = None,
+    ) -> None:
+        self.leg = leg
+        self.fill_price = fill_price
+        self.cached_ask = cached_ask
+        self.cap_pct = cap_pct
+        self.call_leg = call_leg
+        self.put_leg = put_leg
+        super().__init__(
+            f"{leg} fill {fill_price:.6f} > cap {cached_ask * (1 + cap_pct):.6f} "
+            f"(cached_ask={cached_ask:.6f}, cap={cap_pct:.0%})"
+        )
+
+
 @dataclass
 class FilledLeg:
     instrument_name: str
@@ -39,83 +63,175 @@ def _round_to_tick(price: float) -> float:
     return round(round(price / _OPTION_TICK_SIZE) * _OPTION_TICK_SIZE, 4)
 
 
-def _fill_leg(
-    client: DeribitClient,
-    instrument_name: str,
-    amount: float,
-    label: str,
-    settings: Settings,
-    cached_ask: float | None = None,
-) -> FilledLeg:
-    """Aggressive IOC limit sweep at best_ask + 1 tick, then market fallback."""
-    if cached_ask is not None and cached_ask > 0:
-        best_ask = cached_ask
-    else:
-        book = client.public("get_order_book", {"instrument_name": instrument_name, "depth": "1"})
-        best_ask = float(book.get("best_ask_price", 0))
-        if best_ask <= 0:
-            raise RuntimeError(f"No valid ask for {instrument_name}")
-
-    sweep_price = _round_to_tick(best_ask + _OPTION_TICK_SIZE)
-    log.info("sweep_limit", instrument=instrument_name, amount=amount, best_ask=best_ask, sweep_price=sweep_price)
-
-    try:
-        result = client.private("buy", {
-            "instrument_name": instrument_name,
-            "amount": amount,
-            "type": "limit",
-            "price": sweep_price,
-            "time_in_force": "immediate_or_cancel",
-            "label": label,
-        })
-    except DeribitClientError as exc:
-        log.warning("sweep_rejected", instrument=instrument_name, error=str(exc))
-        if not settings.allow_market_fallback:
-            raise
-        result = {"order": {"filled_amount": 0, "order_id": "none", "average_price": 0}}
-
-    order = result["order"]
-    filled = float(order.get("filled_amount", 0))
-
-    if filled >= amount:
-        avg = float(order.get("average_price", sweep_price))
-        log.info("leg_filled_sweep", instrument=instrument_name, filled=filled, avg_price=avg)
-        return FilledLeg(instrument_name=instrument_name, order_id=order["order_id"],
-                         direction="buy", amount=amount, average_price=avg,
-                         filled_amount=filled, label=label)
-
-    remaining = amount - filled
-    log.info("sweep_partial", instrument=instrument_name, filled=filled, remaining=remaining)
-
-    if not settings.allow_market_fallback:
-        raise RuntimeError(f"Partial fill {instrument_name}: filled={filled}, remaining={remaining}")
-
-    mkt_result = client.private("buy", {
+def _build_sweep_params(instrument_name: str, amount: float, cached_ask: float, label: str) -> dict[str, Any]:
+    sweep_price = _round_to_tick(cached_ask + _OPTION_TICK_SIZE)
+    return {
         "instrument_name": instrument_name,
-        "amount": remaining,
-        "type": "market",
+        "amount": amount,
+        "type": "limit",
+        "price": sweep_price,
+        "time_in_force": "immediate_or_cancel",
         "label": label,
-    })
-    mkt_order = mkt_result["order"]
-    mkt_filled = float(mkt_order.get("filled_amount", 0))
-    mkt_avg = float(mkt_order.get("average_price", 0))
+    }
 
-    sweep_avg = float(order.get("average_price", 0))
-    total_filled = filled + mkt_filled
-    vwap = ((sweep_avg * filled) + (mkt_avg * mkt_filled)) / total_filled if total_filled > 0 else 0
 
-    log.info("leg_filled_market", instrument=instrument_name, sweep_filled=filled, mkt_filled=mkt_filled, vwap=round(vwap, 6))
+def _parse_fill(order: dict[str, Any]) -> tuple[float, float]:
+    """Return (filled_amount, average_price) from an order result."""
+    return float(order.get("filled_amount", 0)), float(order.get("average_price", 0))
 
-    if total_filled < amount:
-        log.warning("incomplete_fill", instrument=instrument_name, requested=amount, filled=total_filled)
+
+def _fill_legs_parallel(
+    client: DeribitClient,
+    call_name: str,
+    put_name: str,
+    amount: float,
+    call_label: str,
+    put_label: str,
+    settings: Settings,
+    cached_call_ask: float,
+    cached_put_ask: float,
+) -> tuple[FilledLeg, FilledLeg]:
+    """Fill both legs in parallel: IOC sweep, then parallel market fallback for remainders."""
+    call_sweep_price = _round_to_tick(cached_call_ask + _OPTION_TICK_SIZE)
+    put_sweep_price = _round_to_tick(cached_put_ask + _OPTION_TICK_SIZE)
+
+    log.info("parallel_sweep",
+             call=call_name, put=put_name, amount=amount,
+             call_ask=cached_call_ask, call_sweep=call_sweep_price,
+             put_ask=cached_put_ask, put_sweep=put_sweep_price)
+
+    call_result, put_result = client.parallel(
+        ("private/buy", _build_sweep_params(call_name, amount, cached_call_ask, call_label)),
+        ("private/buy", _build_sweep_params(put_name, amount, cached_put_ask, put_label)),
+    )
+
+    call_filled, call_avg = _parse_fill(call_result["order"])
+    put_filled, put_avg = _parse_fill(put_result["order"])
+
+    log.info("sweep_results",
+             call_filled=call_filled, call_avg=round(call_avg, 6),
+             put_filled=put_filled, put_avg=round(put_avg, 6))
+
+    call_remaining = amount - call_filled
+    put_remaining = amount - put_filled
+
+    if (call_remaining > 0 or put_remaining > 0) and settings.allow_market_fallback:
+        if call_remaining > 0:
+            try:
+                mkt_call_result = client.private("buy", {
+                    "instrument_name": call_name, "amount": call_remaining,
+                    "type": "market", "label": call_label,
+                })
+                mkt_call_filled, mkt_call_avg = _parse_fill(mkt_call_result["order"])
+                total_call = call_filled + mkt_call_filled
+                call_avg = ((call_avg * call_filled) + (mkt_call_avg * mkt_call_filled)) / total_call if total_call > 0 else 0
+                call_filled = total_call
+            except DeribitClientError as exc:
+                log.warning("call_market_fallback_failed", instrument=call_name, error=str(exc))
+
+        if put_remaining > 0:
+            try:
+                mkt_put_result = client.private("buy", {
+                    "instrument_name": put_name, "amount": put_remaining,
+                    "type": "market", "label": put_label,
+                })
+                mkt_put_filled, mkt_put_avg = _parse_fill(mkt_put_result["order"])
+                total_put = put_filled + mkt_put_filled
+                put_avg = ((put_avg * put_filled) + (mkt_put_avg * mkt_put_filled)) / total_put if total_put > 0 else 0
+                put_filled = total_put
+            except DeribitClientError as exc:
+                log.warning("put_market_fallback_failed", instrument=put_name, error=str(exc))
+
+    log.info("parallel_fill_done",
+             call_filled=call_filled, call_vwap=round(call_avg, 6),
+             put_filled=put_filled, put_vwap=round(put_avg, 6))
+
+    if call_filled < amount:
+        log.warning("incomplete_fill", instrument=call_name, requested=amount, filled=call_filled)
         try:
-            client.private("cancel_all_by_instrument", {"instrument_name": instrument_name, "type": "all"})
+            client.private("cancel_all_by_instrument", {"instrument_name": call_name, "type": "all"})
+        except DeribitClientError:
+            pass
+    if put_filled < amount:
+        log.warning("incomplete_fill", instrument=put_name, requested=amount, filled=put_filled)
+        try:
+            client.private("cancel_all_by_instrument", {"instrument_name": put_name, "type": "all"})
         except DeribitClientError:
             pass
 
-    return FilledLeg(instrument_name=instrument_name, order_id=mkt_order["order_id"],
-                     direction="buy", amount=total_filled, average_price=round(vwap, 6),
-                     filled_amount=total_filled, label=label)
+    call_leg = FilledLeg(
+        instrument_name=call_name, order_id=call_result["order"].get("order_id", ""),
+        direction="buy", amount=call_filled, average_price=round(call_avg, 6),
+        filled_amount=call_filled, label=call_label,
+    )
+    put_leg = FilledLeg(
+        instrument_name=put_name, order_id=put_result["order"].get("order_id", ""),
+        direction="buy", amount=put_filled, average_price=round(put_avg, 6),
+        filled_amount=put_filled, label=put_label,
+    )
+    return call_leg, put_leg
+
+
+def check_premium_cap(
+    call_leg: FilledLeg,
+    put_leg: FilledLeg,
+    cached_call_ask: float,
+    cached_put_ask: float,
+    cap_pct: float,
+) -> None:
+    """Raise EntryCapBreached if either leg's fill price exceeds the cap."""
+    call_cap = cached_call_ask * (1 + cap_pct)
+    put_cap = cached_put_ask * (1 + cap_pct)
+
+    if call_leg.average_price > call_cap:
+        log.warning("entry_cap_breached",
+                     leg="call", fill=call_leg.average_price,
+                     cached=cached_call_ask, cap=round(call_cap, 6))
+        raise EntryCapBreached("call", call_leg.average_price, cached_call_ask, cap_pct,
+                                call_leg=call_leg, put_leg=put_leg)
+
+    if put_leg.average_price > put_cap:
+        log.warning("entry_cap_breached",
+                     leg="put", fill=put_leg.average_price,
+                     cached=cached_put_ask, cap=round(put_cap, 6))
+        raise EntryCapBreached("put", put_leg.average_price, cached_put_ask, cap_pct,
+                                call_leg=call_leg, put_leg=put_leg)
+
+    log.info("premium_cap_ok",
+             call_fill=call_leg.average_price, call_cap=round(call_cap, 6),
+             put_fill=put_leg.average_price, put_cap=round(put_cap, 6))
+
+
+def close_failed_entry(client: DeribitClient, call_leg: FilledLeg, put_leg: FilledLeg) -> None:
+    """Market-sell both legs to unwind a failed entry attempt."""
+    date_tag = utcnow().strftime("%Y%m%d")
+    sells: list[tuple[str, dict[str, Any] | None]] = []
+
+    if call_leg.filled_amount > 0:
+        sells.append(("private/sell", {
+            "instrument_name": call_leg.instrument_name,
+            "amount": call_leg.filled_amount,
+            "type": "market", "reduce_only": "true",
+            "label": f"cap-unwind-call-{date_tag}",
+        }))
+    if put_leg.filled_amount > 0:
+        sells.append(("private/sell", {
+            "instrument_name": put_leg.instrument_name,
+            "amount": put_leg.filled_amount,
+            "type": "market", "reduce_only": "true",
+            "label": f"cap-unwind-put-{date_tag}",
+        }))
+
+    if not sells:
+        return
+
+    results = client.parallel(*sells)
+    for r in results:
+        order = r["order"]
+        log.info("cap_unwind_filled",
+                 instrument=order["instrument_name"],
+                 filled=float(order.get("filled_amount", 0)),
+                 avg=round(float(order.get("average_price", 0)), 6))
 
 
 def _trim_excess(client: DeribitClient, instrument_name: str, excess_qty: float, date_tag: str) -> None:
@@ -138,23 +254,23 @@ def enter_straddle(
     instruments: StraddleInstruments,
     contracts: int,
     settings: Settings,
-    cached_call_ask: float | None = None,
-    cached_put_ask: float | None = None,
+    cached_call_ask: float,
+    cached_put_ask: float,
 ) -> StraddleEntry:
-    """Enter a long straddle: buy call + buy put at the same strike."""
+    """Enter a long straddle with parallel execution, premium cap check, and leg balancing."""
     date_tag = utcnow().strftime("%Y%m%d")
     amount = float(contracts)
 
-    call_leg = _fill_leg(client, instruments.call_name, amount, f"straddle-call-{date_tag}", settings, cached_ask=cached_call_ask)
-    log.info("call_leg_done", order_id=call_leg.order_id, avg_price=call_leg.average_price)
+    call_leg, put_leg = _fill_legs_parallel(
+        client,
+        instruments.call_name, instruments.put_name,
+        amount,
+        f"straddle-call-{date_tag}", f"straddle-put-{date_tag}",
+        settings,
+        cached_call_ask, cached_put_ask,
+    )
 
-    try:
-        put_leg = _fill_leg(client, instruments.put_name, amount, f"straddle-put-{date_tag}", settings, cached_ask=cached_put_ask)
-    except Exception:
-        log.error("put_leg_failed_after_call_filled", call_order_id=call_leg.order_id)
-        raise
-
-    log.info("put_leg_done", order_id=put_leg.order_id, avg_price=put_leg.average_price)
+    check_premium_cap(call_leg, put_leg, cached_call_ask, cached_put_ask, settings.entry_cap_pct)
 
     balanced_qty = min(call_leg.amount, put_leg.amount)
     if balanced_qty <= 0:

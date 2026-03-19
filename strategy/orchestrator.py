@@ -9,7 +9,7 @@ import structlog
 from config.settings import Settings
 from core.client import DeribitClient
 from core.ws_monitor import PriceMonitor
-from strategy.entry import StraddleEntry, enter_straddle
+from strategy.entry import EntryCapBreached, StraddleEntry, close_failed_entry, enter_straddle
 from strategy.exit import close_all, close_tier1
 from strategy.instrument_selector import StraddleInstruments, select_straddle
 from strategy.position_sizer import SizingResult, compute_size
@@ -67,26 +67,50 @@ class StraddleOrchestrator:
 
         threading.Thread(target=_do_close, daemon=True).start()
 
+    def _enter_with_retries(self) -> StraddleEntry:
+        """Attempt parallel entry up to max_entry_attempts, re-selecting on cap breach."""
+        s = self._settings
+
+        for attempt in range(1, s.max_entry_attempts + 1):
+            self._instruments = select_straddle(self._client, s)
+            self._sizing = compute_size(self._client, self._instruments, s)
+
+            log.info("entry_attempt",
+                     attempt=attempt, max_attempts=s.max_entry_attempts,
+                     call=self._instruments.call_name, put=self._instruments.put_name,
+                     contracts=self._sizing.contracts,
+                     tier1=self._sizing.tier1_contracts,
+                     tier2=self._sizing.tier2_contracts,
+                     tp_pct=s.take_profit_pct)
+
+            try:
+                entry = enter_straddle(
+                    self._client, self._instruments, self._sizing.contracts, s,
+                    cached_call_ask=self._sizing.call_ask,
+                    cached_put_ask=self._sizing.put_ask,
+                )
+                return entry
+
+            except EntryCapBreached as exc:
+                log.warning("entry_cap_breached_closing",
+                            attempt=attempt, detail=str(exc))
+                if exc.call_leg and exc.put_leg:
+                    close_failed_entry(self._client, exc.call_leg, exc.put_leg)
+                if attempt >= s.max_entry_attempts:
+                    raise RuntimeError(
+                        f"Entry aborted after {attempt} attempts: premium cap breached"
+                    ) from exc
+                log.info("re_selecting_instruments", next_attempt=attempt + 1)
+
+        raise RuntimeError("Entry failed: no attempts remaining")
+
     def run(self) -> None:
         """Execute the full lifecycle synchronously (blocks until exit time)."""
         s = self._settings
 
         self._client = DeribitClient(s)
         try:
-            self._instruments = select_straddle(self._client, s)
-            self._sizing = compute_size(self._client, self._instruments, s)
-
-            log.info("tier_split",
-                     total=self._sizing.contracts,
-                     tier1=self._sizing.tier1_contracts,
-                     tier2=self._sizing.tier2_contracts,
-                     tp_pct=s.take_profit_pct)
-
-            self._entry = enter_straddle(
-                self._client, self._instruments, self._sizing.contracts, s,
-                cached_call_ask=self._sizing.call_ask,
-                cached_put_ask=self._sizing.put_ask,
-            )
+            self._entry = self._enter_with_retries()
 
             entry_premium = self._entry.per_contract_premium
             tp_threshold = entry_premium * (1 + s.take_profit_pct)

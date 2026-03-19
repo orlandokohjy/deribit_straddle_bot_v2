@@ -5,7 +5,10 @@ Automated BTC long straddle with tiered exit strategy on Deribit.
 ## Strategy
 
 1. **Entry** — At run time, allocate 20% of account equity to buy N contracts of
-   a BTC call + put at the same strike (call slightly ITM).
+   a BTC call + put at the same strike (call slightly ITM). Both legs are placed
+   **in parallel**. If either leg fills at >50% above the quoted ask, both legs
+   are closed and the bot re-selects a fresh strike at the current spot price
+   for one retry (then aborts if still breached).
 2. **Tier 1 (1/5 of N)** — Take profit when the *combined* straddle premium
    (call mark + put mark) rises 50% above entry. Both legs are closed simultaneously.
 3. **Tier 2 (4/5 of N)** — Close all remaining contracts at 18:00 UTC regardless of PnL.
@@ -58,5 +61,7 @@ crontab -e
 | `TAKE_PROFIT_PCT` | `0.50` | Combined premium TP threshold |
 | `EXIT_HOUR_UTC` | `18` | Tier 2 close hour (UTC) |
 | `EXIT_MINUTE_UTC` | `0` | Tier 2 close minute (UTC) |
+| `ENTRY_CAP_PCT` | `0.50` | Max fill price above cached ask before abort |
+| `MAX_ENTRY_ATTEMPTS` | `2` | Entry attempts before giving up (1 = no retry) |
 | `MAX_ORDER_RETRIES` | `3` | Retries for partial fills |
 | `ALLOW_MARKET_FALLBACK` | `true` | Fall back to market orders |

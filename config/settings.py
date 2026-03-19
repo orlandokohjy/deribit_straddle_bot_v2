@@ -41,6 +41,9 @@ class Settings:
     exit_hour_utc: int = 18
     exit_minute_utc: int = 0
 
+    entry_cap_pct: float = 0.50
+    max_entry_attempts: int = 2
+
     max_order_retries: int = 3
     allow_market_fallback: bool = True
 
@@ -63,6 +66,10 @@ class Settings:
             raise ValueError(f"TIER1_FRACTION must be in (0, 1), got {self.tier1_fraction}")
         if self.take_profit_pct <= 0:
             raise ValueError(f"TAKE_PROFIT_PCT must be > 0, got {self.take_profit_pct}")
+        if self.entry_cap_pct <= 0:
+            raise ValueError(f"ENTRY_CAP_PCT must be > 0, got {self.entry_cap_pct}")
+        if self.max_entry_attempts < 1:
+            raise ValueError(f"MAX_ENTRY_ATTEMPTS must be >= 1, got {self.max_entry_attempts}")
         if not 0 <= self.exit_hour_utc <= 23:
             raise ValueError(f"EXIT_HOUR_UTC must be 0-23, got {self.exit_hour_utc}")
 
@@ -79,6 +86,8 @@ def load_settings() -> Settings:
         take_profit_pct=float(os.getenv("TAKE_PROFIT_PCT", "0.50")),
         exit_hour_utc=int(os.getenv("EXIT_HOUR_UTC", "18")),
         exit_minute_utc=int(os.getenv("EXIT_MINUTE_UTC", "0")),
+        entry_cap_pct=float(os.getenv("ENTRY_CAP_PCT", "0.50")),
+        max_entry_attempts=int(os.getenv("MAX_ENTRY_ATTEMPTS", "2")),
         max_order_retries=int(os.getenv("MAX_ORDER_RETRIES", "3")),
         allow_market_fallback=_bool_env("ALLOW_MARKET_FALLBACK", True),
     )
